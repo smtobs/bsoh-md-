@@ -1,0 +1,284 @@
+# WPS 온보딩 프로세스 정리 (AP MLD / bSTA MLD)
+
+이 문서는 AP MLD/bSTA MLD 시나리오에서 WPS 온보딩 시 데몬 간 상호작용을 단계별로 정리한 내용이다.
+기존 동작과 추가된 동작을 분리해, 디버깅/로그 추적 시 빠르게 참조할 수 있도록 구성했다.
+
+## 1) 참여 모듈
+
+- `MAPD`: EasyMesh 상위 제어, 설정 분배
+- `1905D`: IEEE 1905.1 메시지 처리, Topology/Autoconfig 교환
+- `WAPPD`: 무선 설정 트리거/중개
+- `Supplicant` 또는 `HostAPD`: WPS 트리거/온보딩 수행
+- `Driver`: 최종 BSS 파라미터 반영
+- `Controller`: 토폴로지/오토컨피그 응답 제공 (컨트롤러 역할 노드)
+
+## 2) Enrollee Agent 측 WPS 온보딩 흐름
+
+아래는 "새 Agent(Enrollee)"가 WPS로 설정을 받아오는 흐름이다.
+
+1. `WAPPD`가 우선순위가 가장 높은 인터페이스에서 WPS를 트리거한다.
+2. `WAPPD -> Supplicant`: AP 측 WPS 시작 요청 (`Multi_AP = 1` 조건).
+3. `Supplicant -> Driver`: WPS Onboarding 수행.
+4. `Supplicant -> Controller`: 연결 요청(Connection Request, NL 계열 이벤트).
+5. 초기 인증/연결 후 BH(Backhaul) 준비 상태를 데몬 간 공유한다.
+6. `1905D`는 Topology DB 정보를 교환하고 Autoconfig Response를 처리한다.
+7. 각 라디오별 무선 설정(SSID/보안/키 등)을 반영한다.
+8. 신규 확장 항목으로 다음 설정이 전달/적용된다.
+   - `Early AP Capability bit`
+   - `Early AP Capability Report`
+   - `AP MLD Config`
+   - `bSTA MLD Config`
+9. 필요 시 bSTA가 재연결(disconnect/reconnect)하여 새 설정으로 붙는다.
+10. 최종적으로 Driver가 BSS에 새 SSID/보안/키를 적용한다.
+
+## 3) Controller 측 WPS 온보딩 흐름
+
+아래는 "Controller 또는 이미 온보딩된 Agent"가 요청 Agent를 구성해 주는 관점이다.
+
+1. `1905D -> WAPPD`: 2G/5G 동시(concurrent) WPS 트리거 이벤트 전달.
+2. `WAPPD -> HostAPD`: AP WPS 트리거 (`Multi_AP = 1`).
+3. `HostAPD <-> New Agent`: WPS Onboarding 절차 수행.
+4. `1905D`는 다음 1905 메시지 흐름을 순차 처리한다.
+   - Topology Information
+   - AP-Autoconfig Search
+   - AP-Autoconfig Response
+   - Radio별 1905 Autoconfiguration
+5. `MAPD/1905D`는 무선 BSS 설정 정보를 수집/정리한다.
+6. 신규 확장 항목을 포함해 정책을 전달한다.
+   - `Early AP Capability bit`
+   - `Early AP Capability Report`
+   - `AP MLD Configuration`
+   - `BSTA MLD Configuration`
+
+## 4) 기존 대비 추가/변경 포인트
+
+- `WPS trigger`가 단일 밴드 중심에서 다중 인터페이스/동시 트리거 중심으로 확장됨.
+- `1905 Autoconfiguration` 응답에 MLD 관련 구성(`AP MLD`, `bSTA MLD`)이 명시적으로 포함됨.
+- `Early AP Capability` 정보가 온보딩 초반에 제공되어, 후속 설정 결정을 앞당김.
+- 온보딩 완료 후 드라이버 반영 시점까지의 데몬 체인이 명확히 분리됨.
+
+## 5) 운영/디버깅 체크리스트
+
+### Agent(Enrollee) 측
+
+- `WAPPD`에서 WPS 트리거 인터페이스 선택 로그 확인
+- `Supplicant`의 WPS 시작/완료 이벤트 확인
+- `1905D`의 Autoconfig Response 수신 및 파싱 결과 확인
+- `AP MLD Config`, `bSTA MLD Config` 수신 여부 확인
+- 최종 Driver 설정 반영(SSID/보안/키) 성공 여부 확인
+
+### Controller 측
+
+- `1905D`에서 Search/Response 프레임 교환 순서 확인
+- `HostAPD`의 WPS 세션 생성/종료 로그 확인
+- Early AP Capability 정보 생성/전달 여부 확인
+- Radio별 Autoconfig 메시지 누락 여부 확인
+
+## 6) 간단 시퀀스(텍스트)
+
+### Enrollee Agent
+
+`WAPPD -> Supplicant -> Driver -> Controller -> 1905D -> (Wireless Settings/MLD Config) -> Driver apply`
+
+### Controller
+
+`1905D -> WAPPD -> HostAPD <-> New Agent -> 1905D Autoconfig -> MLD Config delivery`
+
+## 7) 참고
+
+- 본 문서는 제공된 다이어그램(Agent/Controller WPS message flow) 기반 요약이다.
+- 실제 코드 추적 시 `mapd`, `1905daemon`, `wappd`, `hostapd/supplicant`, `driver` 로그를 같은 타임라인으로 정렬해서 보는 것을 권장한다.
+
+## 8) 실제 데몬 함수 호출 체인 (코드 기준)
+
+아래 항목은 `mapd`, `1905daemon`, `wappd` 소스에서 확인된 함수 기준이다.
+
+### 8.1 Controller 관점
+
+#### `1905daemon`
+
+- `cont_handle_autoconfig_search(...)`
+  - `insert_cmdu_txq(..., e_ap_autoconfiguration_response, ...)` 호출로 Search에 대한 Response 송신 큐잉
+  - 파일: `1905daemon/src/p1905_ap_autoconfig.c`
+- `cont_handle_autoconfig_wsc(...)`
+  - `insert_cmdu_txq(..., e_ap_autoconfiguration_wsc_m2, ...)` 호출로 M2 송신 큐잉
+  - 파일: `1905daemon/src/p1905_ap_autoconfig.c`
+- `process_cmdu_rx(...)`
+  - `AP_AUTOCONFIG_SEARCH/RESPONSE/WSC/RENEW` 수신 후 `parse_*` -> `cont_handle_*` 경로
+  - 파일: `1905daemon/src/cmdu_message_parse.c`
+- `cmdu_tx_msg(...)`
+  - `e_ap_autoconfiguration_search/response/wsc_m2/renew`에 따라 `ap_autoconfiguration_*_message(...)` 생성
+  - 파일: `1905daemon/src/cmdu.c`, `1905daemon/src/cmdu_message.c`
+
+#### `mapd`
+
+- `mapd_trigger_wps(...)`
+  - 로컬 BSS: `wlanif_issue_wapp_command(..., WAPP_USER_TRIGGER_WPS, ...)`
+  - 원격 Agent: `map_1905_Send_Vendor_Specific_Message(...)` (vendor TLV `FUNC_VENDOR_TRIGER_WPS`)
+  - 파일: `mapd/mapd.c`
+- `_1905_handle_vendor_msg(...)`
+  - `FUNC_VENDOR_TRIGER_WPS` 수신 시 `mapd_trigger_wps(...)` 재호출
+  - 파일: `mapd/src/1905_if/1905_if.c`
+
+#### `wappd`
+
+- `wapp_ctrl_iface_cmd_wps_pbc_trigger(...)` -> `wapp_wps_pbc_trigger(...)`
+  - 파일: `wappd/common/ctrl_iface_unix.c`, `wappd/common/wapp_cmm.c`
+- `wapp_wps_pbc_trigger(...)` (configured AP 경로)
+  - `wps_ctrl_run_ap_wps(...)` -> `drv_send_wps_pbc(...)` 또는 `hostapd_cli ... wps_pbc`
+  - 파일: `wappd/common/wapp_cmm.c`, `wappd/wps/wps.c`
+
+### 8.2 Agent(Enrollee) 관점
+
+#### `1905daemon`
+
+- `ap_autoconfig_enrolle_sm(...)` (상태머신)
+  - `wait_4_send_ap_autoconfig_search` 상태에서 `ap_autoconfig_search(...)`
+  - `wait_4_send_m1` 상태에서 `insert_cmdu_txq(..., e_ap_autoconfiguration_wsc_m1, ...)`
+  - 파일: `1905daemon/src/p1905_ap_autoconfig.c`
+- 수신 처리: `process_cmdu_rx(...)`
+  - `AP_AUTOCONFIG_RESPONSE` -> `parse_ap_autoconfig_response_message(...)` -> `cont_handle_autoconfig_response(...)`
+  - `AP_AUTOCONFIG_WSC` -> `parse_ap_autoconfig_wsc_message(...)` -> `cont_handle_autoconfig_wsc(...)`
+  - 파일: `1905daemon/src/cmdu_message_parse.c`
+
+#### `mapd`
+
+- `_1905_AUTOCONFIG_RENEW_EVENT`
+  - `wlanif_issue_wapp_command(..., WAPP_USER_SET_RADIO_RENEW, ...)` 호출
+  - 파일: `mapd/src/1905_if/1905_if.c`
+- `_1905_AUTOCONFIG_SEARCH_EVENT` (R3 경로)
+  - `wlanif_issue_wapp_command(..., WAPP_USER_SEND_AUTOCONFIG_TRIGGER, ...)` 호출
+  - 파일: `mapd/src/1905_if/1905_if.c`
+- `wlanif_handle_mapd_renew(...)` -> `mapd_renew(...)`
+  - 파일: `mapd/src/dot11_if/wapp_if.c`, `mapd/mapd.c`
+
+#### `wappd`
+
+- `wapp_wps_pbc_trigger(...)` (unconfigured STA/Agent 경로)
+  - `wps_ctrl_run_cli_wps(...)` -> `drv_send_wps_pbc(...)`
+  - 파일: `wappd/common/wapp_cmm.c`, `wappd/wps/wps.c`
+- `wdev_handle_wsc_eapol_end_notif(...)`
+  - `wapp_send_1905_msg(..., WAPP_MAP_AGENT_WPS_SUCCESS, ...)` 전송
+  - 파일: `wappd/common/wdev.c`
+- `map_wps_conf_done_send_map_renew(...)`
+  - `map_1905_send(..., WAPP_MAP_RENEW, ...)` 호출
+  - 파일: `wappd/map/map_1905.c`
+
+### 8.3 호출 순서 요약
+
+- Controller:
+  - `mapd_trigger_wps` -> `wapp_ctrl_iface_cmd_wps_pbc_trigger` -> `wapp_wps_pbc_trigger` -> `wps_ctrl_run_ap_wps`
+  - `AP_AUTOCONFIG_SEARCH 수신` -> `cont_handle_autoconfig_search` -> `e_ap_autoconfiguration_response`
+  - `AP_AUTOCONFIG_WSC(M1) 수신` -> `cont_handle_autoconfig_wsc` -> `e_ap_autoconfiguration_wsc_m2`
+- Agent:
+  - `ap_autoconfig_enrolle_sm` -> `e_ap_autoconfiguration_search` -> `AP_AUTOCONFIG_RESPONSE 수신`
+  - `ap_autoconfig_enrolle_sm` -> `e_ap_autoconfiguration_wsc_m1` -> `AP_AUTOCONFIG_WSC(M2) 수신`
+  - `wdev_handle_wsc_eapol_end_notif` -> `WAPP_MAP_AGENT_WPS_SUCCESS` -> `WAPP_MAP_RENEW`
+
+### 8.4 추가 확인 필요 항목
+
+- `WAPP_MAP_AGENT_WPS_SUCCESS` 이벤트가 최종적으로 어떤 1905 TLV/프레임으로 변환되는지의 끝단 발신 함수는 런타임 설정 경로에 따라 분기 가능성이 있어 추가 추적이 필요하다.
+- R3 환경에서 `WAPP_USER_SEND_AUTOCONFIG_TRIGGER`가 `DPP` 경로와 `WPS` 경로를 어떻게 나누는지(설정 플래그/초기화 순서)는 config 초기화 코드까지 함께 확인하는 것이 안전하다.
+
+## 9) 시퀀스 다이어그램 (보기 편한 요약)
+
+### 9.1 Controller 관점 (AP/Registrar 측)
+
+```mermaid
+sequenceDiagram
+    participant MAPD
+    participant WAPPD
+    participant HostAPD
+    participant D1905 as 1905Daemon
+    participant NewAgent as New Agent
+
+    MAPD->>WAPPD: mapd_trigger_wps()
+    WAPPD->>WAPPD: wapp_ctrl_iface_cmd_wps_pbc_trigger()
+    WAPPD->>WAPPD: wapp_wps_pbc_trigger()
+    WAPPD->>HostAPD: hostapd_cli "WPS_PBC" / drv_send_wps_pbc()
+    HostAPD->>HostAPD: hostapd_wps_button_pushed()
+    HostAPD->>HostAPD: wps_registrar_button_pushed()
+
+    NewAgent->>D1905: AP_AUTOCONFIG_SEARCH
+    D1905->>D1905: cont_handle_autoconfig_search()
+    D1905-->>NewAgent: AP_AUTOCONFIG_RESPONSE
+    NewAgent->>D1905: AP_AUTOCONFIG_WSC(M1)
+    D1905->>D1905: cont_handle_autoconfig_wsc()
+    D1905-->>NewAgent: AP_AUTOCONFIG_WSC(M2)
+```
+
+### 9.2 Agent 관점 (Enrollee/bSTA 측)
+
+```mermaid
+sequenceDiagram
+    participant MAPD
+    participant WAPPD
+    participant Supplicant
+    participant D1905 as 1905Daemon
+    participant Controller as Controller 1905D
+
+    MAPD->>WAPPD: WAPP_USER_TRIGGER_WPS
+    WAPPD->>WAPPD: wapp_wps_pbc_trigger()
+    WAPPD->>Supplicant: wps_ctrl_run_cli_wps()
+    Supplicant->>Supplicant: WPS_PBC (ctrl iface)
+    Supplicant->>Supplicant: wpas_wps_start_pbc()
+
+    D1905->>D1905: ap_autoconfig_enrolle_sm()
+    D1905-->>Controller: AP_AUTOCONFIG_SEARCH
+    Controller-->>D1905: AP_AUTOCONFIG_RESPONSE
+    D1905-->>Controller: AP_AUTOCONFIG_WSC(M1)
+    Controller-->>D1905: AP_AUTOCONFIG_WSC(M2)
+
+    WAPPD->>MAPD: WAPP_MAP_AGENT_WPS_SUCCESS
+    WAPPD->>MAPD: WAPP_MAP_RENEW
+```
+
+## 10) `hostapd-wpad-full-openssl` 추가 분석 결과
+
+아래는 요청하신 `hostapd-2022-07-29-b704dc72` 기준으로 확인된 실제 WPS 함수 경로다.
+
+### 10.1 AP(HostAPD Registrar) 경로
+
+- Ctrl 명령 수신
+  - `hostapd/ctrl_iface.c`
+  - `WPS_PBC` 명령 처리 시 `hostapd_wps_button_pushed(hapd, NULL)` 호출
+- AP 전역 WPS 버튼 처리
+  - `src/ap/wps_hostapd.c`
+  - `hostapd_wps_button_pushed(...)` -> `hostapd_wps_for_each(...)` -> `wps_button_pushed(...)`
+  - `wps_button_pushed(...)` -> `wps_registrar_button_pushed(hapd->wps->registrar, ...)`
+- Registrar 내부 PBC 활성화
+  - `src/wps/wps_registrar.c`
+  - `wps_registrar_button_pushed(...)`에서
+    - PBC overlap 검사: `wps_registrar_pbc_overlap(...)`
+    - Registrar 활성화: `selected_registrar=1`, `pbc=1`
+    - 타이머 등록: `eloop_register_timeout(WPS_PBC_WALK_TIME, ...)`
+
+정리 체인:
+- `WPS_PBC` -> `hostapd_wps_button_pushed` -> `wps_registrar_button_pushed` -> PBC active/timer
+
+### 10.2 STA(Supplicant Enrollee) 경로
+
+- Ctrl 명령 수신
+  - `wpa_supplicant/ctrl_iface.c`
+  - `WPS_PBC` 명령 처리 시 `wpa_supplicant_ctrl_iface_wps_pbc(...)` 호출
+- Enrollee WPS 시작
+  - `wpa_supplicant/wps_supplicant.c`
+  - `wpa_supplicant_ctrl_iface_wps_pbc(...)` -> `wpas_wps_start_pbc(...)`
+  - `wpas_wps_start_pbc(...)`에서
+    - 임시 네트워크 생성/설정 (`wpas_wps_add_network`)
+    - `phase1`에 `pbc=1` 및 `multi_ap=1` 조건 반영
+    - `WPS_EV_PBC_ACTIVE` 이벤트 발생
+    - `WPS_PBC_WALK_TIME` 타임아웃 등록
+    - `wpas_wps_reassoc(...)`로 재연결 시도
+
+정리 체인:
+- `WPS_PBC` -> `wpa_supplicant_ctrl_iface_wps_pbc` -> `wpas_wps_start_pbc` -> `wpas_wps_reassoc`
+
+### 10.3 본 프로젝트(`mapd`/`wappd`/`1905daemon`)와의 연결 포인트
+
+- Controller(AP) 측:
+  - `wappd`가 `hostapd_cli WPS_PBC` 또는 드라이버 경유 PBC를 트리거
+  - HostAPD 내부에서는 위 Registrar 체인으로 PBC 세션이 열림
+- Agent(STA) 측:
+  - `wappd`가 CLI WPS를 트리거하면 Supplicant에서 `wpas_wps_start_pbc` 경로로 진행
+  - 이후 1905 Autoconfig(M1/M2) 교환은 `1905daemon` 상태머신(`ap_autoconfig_enrolle_sm`)과 연동
