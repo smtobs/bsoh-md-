@@ -282,3 +282,165 @@ sequenceDiagram
 - Agent(STA) 측:
   - `wappd`가 CLI WPS를 트리거하면 Supplicant에서 `wpas_wps_start_pbc` 경로로 진행
   - 이후 1905 Autoconfig(M1/M2) 교환은 `1905daemon` 상태머신(`ap_autoconfig_enrolle_sm`)과 연동
+
+## 11) WPS 이후 Backhaul 업데이트 시점과 `BH Ready` 개념
+
+`mapd` 관점에서 WPS 온보딩 중 backhaul 정보 업데이트는 단일 이벤트가 아니라, 아래 순서로 단계적으로 진행된다.
+
+### 11.1 `BH Ready`는 무엇인가
+
+- `WAPP_MAP_BH_READY` 이벤트는 `wlanif_handle_bh_ready()`를 통해 `topo_srv_parse_wapp_bh_ready()`로 전달된다.
+- 이 이벤트는 "BH 링크가 올라와서 1905 autoconfig를 진행할 준비가 됨"을 의미하는 게이트 이벤트다.
+- Wi-Fi BH 경로에서는 `ctx->bh_ready_expected == TRUE`일 때만 유효하게 처리된다.
+  - `FALSE`이면 `"bh ready is not expected"` 로그 후 무시된다.
+
+핵심 코드 포인트:
+- `mapd/src/dot11_if/wapp_if.c`: `wlanif_handle_bh_ready()`
+- `mapd/src/topologySrv/wappEvent.c`: `topo_srv_parse_wapp_bh_ready()`
+
+### 11.2 WPS 이후 실제 backhaul 정보 갱신 타임라인
+
+1. `WAPP_MAP_AGENT_WPS_SUCCESS` 수신  
+   - 주로 성공 알림/ACL 동기화 성격이며, BH/BSS DB를 대규모로 갱신하는 지점은 아님.
+2. `WAPP_MAP_RENEW` 수신 -> `wlanif_handle_mapd_renew()` -> `mapd_renew()`  
+   - `map_1905_Set_Read_Bss_Conf_and_Renew_v2()` 호출로 renew/read 사이클 시작.
+3. `oper_bss_report` 수신 -> `topo_srv_parse_wapp_oper_bss_report()` -> `topo_srv_update_own_bss_info()`  
+   - 여기서 BSS/보안/키/MLO 및 `map_vendor_extn(BH_BSS 포함)`이 갱신됨.
+4. APCLI link up/down 수신 -> `ap_selection_handle_cli_state_change()`  
+   - `BH_STATE_WIFI_LINKUP/FAIL`, `bh_assoc_state`, `uplink_bss`, `rssi` 등 운영 상태가 확정됨.
+
+즉, 실무적으로는 `WPS_SUCCESS`가 시작 신호이고, 실제 BH 정보 반영은 `RENEW -> oper_bss_report -> link state`에서 완료된다.
+
+### 11.3 `BH Ready` 처리 시 상태 전이 포인트
+
+- Ethernet BH (`bh_info->type == 0`)는 바로 `map_1905_Set_Bh_Ready()` 호출 가능.
+- Wi-Fi BH는 다음 조건/동작을 탄다.
+  - `bh_ready_expected` 검사
+  - 기존 `bh_link_head`의 assoc state 초기화
+  - 매칭되는 `bh_entry`의 `bssid`, `bh_assoc_state=WAPP_APCLI_ASSOCIATED` 갱신
+  - `topo_srv_update_upstream_device(...)`로 upstream 정보 업데이트
+  - `map_1905_Set_Bh_Ready(...)`로 1905에 BH ready 전달 (중복 링크 상황에서는 autoconfig trigger 제어)
+
+### 11.4 디버깅 시 확인해야 할 로그/상태
+
+- 이벤트 수신:
+  - `WAPP_MAP_AGENT_WPS_SUCCESS`
+  - `WAPP_MAP_RENEW`
+  - `WAPP_MAP_BH_READY`
+- 상태/플래그:
+  - `ctx->bh_ready_expected`
+  - `ctx->current_bh_state` (`BH_STATE_WIFI_BOOTUP`, `BH_STATE_WIFI_LINKUP`, `BH_STATE_WIFI_LINK_FAIL` 등)
+  - `ctx->current_bh_substate` (`BH_SUBSTATE_CONNECT_WAIT`, `BH_SUBSTATE_IDLE` 등)
+- DB 반영:
+  - `topo_srv_update_own_bss_info()`에서 `map_vendor_extn`/BH_BSS 반영 여부
+  - `ap_selection_handle_cli_state_change()`에서 link up 시 `uplink_bss` 반영 여부
+
+## 12) `BH Ready` 포함 시퀀스 다이어그램
+
+### 12.1 정상 흐름 (WPS 성공 -> BH Ready -> BH 정보 반영)
+
+```mermaid
+sequenceDiagram
+    participant WAPPD
+    participant MAPD
+    participant APSEL as apSelection
+    participant TOPO as topologySrv
+    participant D1905 as 1905daemon
+    participant CTRL as Controller 1905D
+
+    WAPPD-->>MAPD: WAPP_MAP_AGENT_WPS_SUCCESS
+    MAPD->>MAPD: wlanif_handle_agent_wps_success()
+    Note over MAPD: 성공 알림/ACL 동기화
+
+    CTRL-->>D1905: AP_AUTOCONFIG_WSC(M2 Credential)
+    D1905-->>MAPD: _1905_SET_WIRELESS_SETTING (msg_buf)
+    MAPD->>WAPPD: WAPP_USER_SET_WIRELESS_SETTING (SSID/Auth/Encr/Key)
+    MAPD->>TOPO: topo_srv_update_wireless_setting()
+    TOPO->>TOPO: topo_srv_update_bss_info()
+
+    WAPPD-->>MAPD: WAPP_MAP_RENEW
+    MAPD->>MAPD: wlanif_handle_mapd_renew()
+    MAPD->>MAPD: mapd_renew()
+    MAPD->>D1905: map_1905_Set_Read_Bss_Conf_and_Renew_v2()
+
+    WAPPD-->>MAPD: WAPP_MAP_BH_READY
+    MAPD->>TOPO: wlanif_handle_bh_ready() -> topo_srv_parse_wapp_bh_ready()
+    TOPO->>TOPO: bh_ready_expected == TRUE 확인
+    TOPO->>D1905: map_1905_Set_Bh_Ready()
+
+    WAPPD-->>MAPD: WAPP_OPERBSS_REPORT
+    MAPD->>TOPO: topo_srv_parse_wapp_oper_bss_report()
+    TOPO->>TOPO: topo_srv_update_own_bss_info()
+    Note over TOPO: map_vendor_extn(BH_BSS), SSID/Auth/Key/MLO 갱신
+
+    WAPPD-->>MAPD: WAPP_APCLI_ASSOC_STAT_CHANGE (LinkUp)
+    MAPD->>APSEL: ap_selection_handle_cli_state_change()
+    APSEL->>APSEL: BH_STATE_WIFI_LINKUP, uplink_bss/rssi 확정
+```
+
+### 12.2 예외 흐름 (BH Ready 예상치 아님/중복 링크)
+
+```mermaid
+sequenceDiagram
+    participant WAPPD
+    participant MAPD
+    participant TOPO as topologySrv
+    participant D1905 as 1905daemon
+
+    WAPPD-->>MAPD: WAPP_MAP_BH_READY (Wi-Fi)
+    MAPD->>TOPO: topo_srv_parse_wapp_bh_ready()
+
+    alt bh_ready_expected == FALSE
+        TOPO->>TOPO: "bh ready is not expected" 로그
+        TOPO-->>MAPD: 이벤트 무시 (autoconfig 미진행)
+    else bh_ready_expected == TRUE
+        alt duplicate link (bh_dup_entry == bh_entry)
+            TOPO->>TOPO: trigger_autconf = 0 설정
+            TOPO->>D1905: map_1905_Set_Bh_Ready() (중복 링크 처리)
+            Note over TOPO,D1905: 불필요한 autoconfig 트리거 억제
+        else normal Wi-Fi BH
+            TOPO->>TOPO: bh_entry assoc state/bssid 업데이트
+            TOPO->>D1905: map_1905_Set_Bh_Ready()
+        end
+    end
+```
+
+## 13) Credential(SSID/보안/키) 전달 구조
+
+WPS 온보딩에서 `SSID/Auth/Encr/Key`는 1905 `AP_AUTOCONFIG_WSC`의 WSC Credential(M2)로 전달되고, 이후 mapd/wappd 내부 IPC로 적용된다.
+
+### 13.1 Controller -> Agent (1905 WSC M2)
+
+- `1905daemon/src/cmdu_message.c`
+  - `ap_autoconfiguration_wsc_message(..., MESSAGE_TYPE_M2)`에서 M2 생성
+- `1905daemon/src/cmdu_tlv.c`
+  - `append_WSC_tlv(..., MESSAGE_TYPE_M2, config_data, ...)`
+- `1905daemon/src/wsc_message.c`
+  - `create_wsc_msg_M2(...)`에서 Credential 필드 구성
+  - `ATTR_SSID_ID` <- `config_data->Ssid`
+  - `ATTR_AUTHENTICATION_TYPE_ID` <- `config_data->AuthMode`
+  - `ATTR_ENCRYPTION_TYPE_ID` <- `config_data->EncrypType`
+  - `ATTR_NETWORK_KEY_ID` <- `config_data->WPAKey`
+
+### 13.2 Agent 내부 반영 (mapd -> wappd)
+
+- `mapd/src/1905_if/1905_if.c`
+  - `_1905_SET_WIRELESS_SETTING` 수신 후
+  - `wlanif_issue_wapp_command(..., WAPP_USER_SET_WIRELESS_SETTING, ..., buf, len, ...)`
+  - `topo_srv_update_wireless_setting(global, buf, len)` 호출
+- `mapd/src/topologySrv/topologySrv.c`
+  - `topo_srv_update_wireless_setting()` -> `topo_srv_update_bss_info()`
+  - `bss_config->Ssid/AuthMode/EncrypType/WPAKey`를 `bss DB`에 반영
+- `wappd/map/map_1905.c`
+  - `WAPP_USER_SET_WIRELESS_SETTING` 수신 시 `map_config_wireless_setting_msg(...)` 적용
+
+### 13.3 Backhaul 전용 적용 경로
+
+- `mapd/src/topologySrv/topologySrv.c`
+  - `send_wapp_event_wireless_settings()`에서 `struct wsc_config` 생성
+  - `AuthMode/EncrypType/WPAKey/Ssid/map_vendor_extension` 채워
+  - `WAPP_USER_SET_BH_WIRELESS_SETTING`로 전달
+- `wappd/map/map_1905.c`
+  - `WAPP_USER_SET_BH_WIRELESS_SETTING` -> `map_config_bh_wireless_setting_msg(...)`
+- `wappd/common/wdev.c`
+  - `wdev_bh_sta_connect_wsc_profile()`에서 APCLI SSID/PSK/Auth/Encr 실제 적용
