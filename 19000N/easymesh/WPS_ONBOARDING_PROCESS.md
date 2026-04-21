@@ -28,8 +28,9 @@
    - `Early AP Capability Report`
    - `AP MLD Config`
    - `bSTA MLD Config`
-9. 필요 시 bSTA가 재연결(disconnect/reconnect)하여 새 설정으로 붙는다.
-10. 최종적으로 Driver가 BSS에 새 SSID/보안/키를 적용한다.
+9. `WAPP_MAP_RENEW -> oper_bss_report -> APCLI link state` 순서로 Backhaul 운영 정보(BH_BSS/uplink_bss/rssi/bh_assoc_state)를 업데이트한다.
+10. 필요 시 bSTA가 재연결(disconnect/reconnect)하여 새 설정으로 붙는다.
+11. 최종적으로 Driver가 BSS에 새 SSID/보안/키를 적용한다.
 
 ## 3) Controller 측 WPS 온보딩 흐름
 
@@ -44,7 +45,8 @@
    - AP-Autoconfig Response
    - Radio별 1905 Autoconfiguration
 5. `MAPD/1905D`는 무선 BSS 설정 정보를 수집/정리한다.
-6. 신규 확장 항목을 포함해 정책을 전달한다.
+6. `WAPP_MAP_RENEW` 이후 `oper_bss_report`/link state 이벤트를 통해 Agent의 Backhaul 상태가 갱신되는지 확인한다.
+7. 신규 확장 항목을 포함해 정책을 전달한다.
    - `Early AP Capability bit`
    - `Early AP Capability Report`
    - `AP MLD Configuration`
@@ -444,3 +446,56 @@ WPS 온보딩에서 `SSID/Auth/Encr/Key`는 1905 `AP_AUTOCONFIG_WSC`의 WSC Cred
   - `WAPP_USER_SET_BH_WIRELESS_SETTING` -> `map_config_bh_wireless_setting_msg(...)`
 - `wappd/common/wdev.c`
   - `wdev_bh_sta_connect_wsc_profile()`에서 APCLI SSID/PSK/Auth/Encr 실제 적용
+
+## 14) 운영 관점 확인법: Controller BH 연결 / Agent Client SSID-MAC
+
+### 14.1 Controller: 어떤 Agent가 어떤 BH MAC으로 연결됐는지 확인
+
+Controller `mapd`는 Agent별(`AL-MAC`)로 BH 링크 정보를 유지한다.
+
+- Agent 식별 키:
+  - `_1905_dev->_1905_info.al_mac_addr` (Agent AL-MAC)
+- BH 연결 MAC 정보:
+  - `bh_entry->neighbor_iface_addr` (Backhaul BSSID)
+  - `bh_entry->connected_iface_addr` (Setup link APCLI-MAC)
+
+관련 코드:
+- `mapd/src/topologySrv/topologySrv.c`
+  - `"BH Link Info for Agent ... AL-MAC"` 출력
+  - `"Backhaul BSSID"`, `"Setup Link APCLI-MAC"` 출력
+
+실행 방법:
+- `mapd_cli /tmp/mapd_ctrl bh_info`
+  - 구현: `mapd/mapd_ctrl/mapd_cli.c` -> `BH_INFO` 명령
+
+### 14.2 Agent: Client가 어느 SSID에 붙었고 MAC이 어디 기록되는지
+
+Agent에서는 STA 이벤트로 `sta_mac`/`bssid`를 받고, `bssid`를 기준으로 SSID를 역매핑한다.
+
+1. 이벤트 파싱(원본)
+- `mapd/src/topologySrv/tlv_parsor.c`
+  - `assoc->sta_addr` <- STA MAC
+  - `assoc->bssid` <- 연결 BSSID
+
+2. SSID 매핑
+- `topo_srv_get_bss_by_bssid(...)`로 `bss_info`를 찾고,
+- `bss_info->ssid`를 통해 "어느 SSID에 연결됐는지" 판별
+- 동일 파일에서 `mapd_user_wireless_client_join/leave(..., sta, bssid, ssid)`로 사용자 이벤트 전달
+
+3. 런타임 DB 기록 위치
+- `mapd/src/topologySrv/topologySrv.c`
+  - `device->wlan_clients` (`connected_clients`)
+  - `device->assoc_clients` (`associated_clients`)
+- 저장 필드:
+  - Client MAC: `client->client_addr`, `assoc_client->client_addr`
+  - BSSID: `client->bss_addr`, `assoc_client->bss->bssid`
+  - APCLI/BH 플래그: `is_APCLI`, `is_bh_link`
+- SSID는 `assoc_client->bss`가 가리키는 `bss_info_db->ssid`에서 조회
+
+### 14.3 빠른 체크 포인트
+
+- Controller에서 BH 확인:
+  - `bh_info` 출력의 `AL-MAC` <-> `Backhaul BSSID/APCLI-MAC` 매핑 확인
+- Agent에서 Client 확인:
+  - `sta_mac + bssid` 이벤트 확인
+  - 해당 `bssid`의 `bss_info_db->ssid` 조회로 최종 SSID 확인
