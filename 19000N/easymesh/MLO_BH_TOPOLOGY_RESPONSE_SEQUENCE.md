@@ -22,6 +22,7 @@ sequenceDiagram
 
     Note over MAPD: [3] mapd 수신 처리
     MAPD->>MAPD: wlanif_handle_client_notification()
+    MAPD->>MAPD: parse_assoc_req()  %% assoc_req IE/ML IE 파싱 (조건부)
     MAPD->>MAPD: topo_srv_parse_wapp_client_notification()  %% STA notification 경로
 
     alt setup_link == 1
@@ -53,6 +54,7 @@ sequenceDiagram
   - `map_build_assoc_cli` (mapd로 client notification 전달)
 - `mapd`
   - `wlanif_handle_client_notification`
+  - `parse_assoc_req` (`wapp_if.c`에서 호출, 구현은 `topologySrv.c`)
   - `topo_srv_parse_wapp_client_notification`
   - `topo_srv_parse_wapp_sta_mld_configuration` (setup-link 기준)
   - `mcr_topo_srv_mld_merge_aff_sta_setup_only` (setup-link 표 보강)
